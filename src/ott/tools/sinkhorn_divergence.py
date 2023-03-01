@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Implements the sinkhorn divergence."""
 from types import MappingProxyType
 from typing import Any, List, Mapping, NamedTuple, Optional, Tuple, Type
 
@@ -159,8 +158,10 @@ def _sinkhorn_divergence(
         parallel_dual_updates=True,
         momentum=acceleration.Momentum(start=0, value=0.5),
         anderson=None,
-        # TODO(michalk8): implicit_diff
     )
+    implicit_diff = kwargs.get("implicit_diff", None)
+    if implicit_diff is not None:
+      kwargs_symmetric["implicit_diff"] = implicit_diff.replace(symmetric=True)
 
   out_xy = sinkhorn.solve(geometry_xy, a, b, **kwargs)
   out_xx = sinkhorn.solve(geometry_xx, a, a, **kwargs_symmetric)
@@ -263,6 +264,7 @@ def segment_sinkhorn_divergence(
       :class:`~ott.geometry.pointcloud.PointCloud` geometry objects from the
       subsets of points and masses selected in `x` and `y`, this could be for
       instance entropy regularization float, scheduler or normalization.
+
   Returns:
     An array of sinkhorn divergence values for each segment.
   """

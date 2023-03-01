@@ -28,11 +28,10 @@ __all__ = ["GWBarycenterState", "GromovWassersteinBarycenter"]
 
 
 class GWBarycenterState(NamedTuple):
-  """Holds the state of the \
-  :class:`~ott.problems.quadratic.gw_barycenter.GWBarycenterProblem`.
+  """State of the GW barycenter problem.
 
   Args:
-    c: Barycenter cost matrix of shape ``[bar_size, bar_size]``.
+    cost: Barycenter cost matrix of shape ``[bar_size, bar_size]``.
     x: Barycenter features of shape ``[bar_size, ndim_fused]``.
       Only used in the fused case.
     a: Weights of the barycenter of shape ``[bar_size,]``.
@@ -50,15 +49,14 @@ class GWBarycenterState(NamedTuple):
   costs: Optional[jnp.ndarray] = None
   gw_convergence: Optional[jnp.ndarray] = None
 
-  def set(self, **kwargs: Any) -> 'GWBarycenterState':
+  def set(self, **kwargs: Any) -> "GWBarycenterState":
     """Return a copy of self, possibly with overwrites."""
     return self._replace(**kwargs)
 
 
 @jax.tree_util.register_pytree_node_class
 class GromovWassersteinBarycenter(was_solver.WassersteinSolver):
-  """Gromov-Wasserstein barycenter solver of the \
-  :class:`~ott.problems.quadratic.gw_barycenter.GWBarycenterProblem`.
+  """Gromov-Wasserstein barycenter solver.
 
   Args:
     epsilon: Entropy regulariser.
@@ -131,7 +129,7 @@ class GromovWassersteinBarycenter(was_solver.WassersteinSolver):
       bar_init: Optional[Union[jnp.ndarray, Tuple[jnp.ndarray,
                                                   jnp.ndarray]]] = None,
       a: Optional[jnp.ndarray] = None,
-      seed: int = 0,
+      rng: jax.random.PRNGKeyArray = jax.random.PRNGKey(0),
   ) -> GWBarycenterState:
     """Initialize the (fused) Gromov-Wasserstein barycenter state.
 
@@ -150,7 +148,7 @@ class GromovWassersteinBarycenter(was_solver.WassersteinSolver):
           the fused case.
 
       a: An array of shape ``[bar_size,]`` containing the barycenter weights.
-      seed: Random seed used when ``bar_init = None``.
+      rng: Random key for seeding used when ``bar_init = None``.
 
     Returns:
       The initial barycenter state.
@@ -162,11 +160,10 @@ class GromovWassersteinBarycenter(was_solver.WassersteinSolver):
 
     if bar_init is None:
       _, b = problem.segmented_y_b
-      rng = jax.random.PRNGKey(seed)
-      keys = jax.random.split(rng, problem.num_measures)
+      rngs = jax.random.split(rng, problem.num_measures)
       linear_solver = self._quad_solver.linear_ot_solver
 
-      transports = init_transports(linear_solver, keys, a, b, problem.epsilon)
+      transports = init_transports(linear_solver, rngs, a, b, problem.epsilon)
       x = problem.update_features(transports, a) if problem.is_fused else None
       cost = problem.update_barycenter(transports, a)
     else:
@@ -272,14 +269,14 @@ class GromovWassersteinBarycenter(was_solver.WassersteinSolver):
 
 @partial(jax.vmap, in_axes=[None, 0, None, 0, None])
 def init_transports(
-    solver, key: jnp.ndarray, a: jnp.ndarray, b: jnp.ndarray,
+    solver, rng: jax.random.PRNGKeyArray, a: jnp.ndarray, b: jnp.ndarray,
     epsilon: Optional[float]
 ) -> jnp.ndarray:
   """Initialize random 2D point cloud and solve the linear OT problem.
 
   Args:
     solver: Linear OT solver.
-    key: Random key.
+    rng: Random key for seeding.
     a: Source marginals (e.g., for barycenter) of shape ``[bar_size,]``.
     b: Target marginals of shape ``[max_measure_size,]``.
     epsilon: Entropy regularization.
@@ -287,9 +284,9 @@ def init_transports(
   Returns:
     Transport map of shape ``[bar_size, max_measure_size]``.
   """
-  key1, key2 = jax.random.split(key, 2)
-  x = jax.random.normal(key1, shape=(len(a), 2))
-  y = jax.random.normal(key2, shape=(len(b), 2))
+  rng1, rng2 = jax.random.split(rng, 2)
+  x = jax.random.normal(rng1, shape=(len(a), 2))
+  y = jax.random.normal(rng2, shape=(len(b), 2))
   geom = pointcloud.PointCloud(
       x, y, epsilon=epsilon, src_mask=a > 0, tgt_mask=b > 0
   )
@@ -297,7 +294,7 @@ def init_transports(
   return solver(problem).matrix
 
 
-def iterations(
+def iterations(  # noqa: D103
     solver: GromovWassersteinBarycenter,
     problem: gw_barycenter.GWBarycenterProblem, init_state: GWBarycenterState
 ) -> GWBarycenterState:
@@ -318,7 +315,7 @@ def iterations(
     solver, problem = constants
     return solver.update_state(state, iteration, problem)
 
-  state = fixed_point_loop.fixpoint_iter(
+  return fixed_point_loop.fixpoint_iter(
       cond_fn=cond_fn,
       body_fn=body_fn,
       min_iterations=solver.min_iterations,
@@ -327,4 +324,3 @@ def iterations(
       constants=(solver, problem),
       state=init_state,
   )
-  return state

@@ -15,6 +15,7 @@
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Literal,
     Mapping,
     NamedTuple,
@@ -27,6 +28,7 @@ from typing import (
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import host_callback
 
 from ott.geometry import geometry
 from ott.initializers.linear import initializers as init_lib
@@ -42,6 +44,9 @@ if TYPE_CHECKING:
 
 __all__ = ["Sinkhorn", "SinkhornOutput", "solve"]
 
+ProgressCallbackFn_t = Callable[
+    [Tuple[np.ndarray, np.ndarray, np.ndarray, "SinkhornState"]], None]
+
 
 class SinkhornState(NamedTuple):
   """Holds the state variables used to solve OT with Sinkhorn."""
@@ -52,7 +57,7 @@ class SinkhornState(NamedTuple):
   old_fus: Optional[jnp.ndarray] = None
   old_mapped_fus: Optional[jnp.ndarray] = None
 
-  def set(self, **kwargs: Any) -> 'SinkhornState':
+  def set(self, **kwargs: Any) -> "SinkhornState":
     """Return a copy of self, with potential overwrites."""
     return self._replace(**kwargs)
 
@@ -79,7 +84,7 @@ class SinkhornState(NamedTuple):
         parallel_dual_updates=parallel_dual_updates
     )
 
-  def ent_reg_cost(
+  def ent_reg_cost(  # noqa: D102
       self, ot_prob: linear_problem.LinearProblem, lse_mode: bool
   ) -> float:
     return ent_reg_cost(self.fu, self.gv, ot_prob, lse_mode)
@@ -217,10 +222,9 @@ def marginal_error(
   else:
     marginal = geom.marginal_from_scalings(f_u, g_v, axis=axis)
   norm_error = jnp.asarray(norm_error)
-  error = jnp.sum(
+  return jnp.sum(
       jnp.abs(marginal - target) ** norm_error[:, jnp.newaxis], axis=1
   ) ** (1.0 / norm_error)
-  return error
 
 
 def ent_reg_cost(
@@ -287,14 +291,14 @@ class SinkhornOutput(NamedTuple):
   reg_ot_cost: Optional[float] = None
   ot_prob: Optional[linear_problem.LinearProblem] = None
 
-  def set(self, **kwargs: Any) -> 'SinkhornOutput':
+  def set(self, **kwargs: Any) -> "SinkhornOutput":
     """Return a copy of self, with potential overwrites."""
     return self._replace(**kwargs)
 
   def set_cost(  # noqa: D102
       self, ot_prob: linear_problem.LinearProblem, lse_mode: bool,
       use_danskin: bool
-  ) -> 'SinkhornOutput':
+  ) -> "SinkhornOutput":
     f = jax.lax.stop_gradient(self.f) if use_danskin else self.f
     g = jax.lax.stop_gradient(self.g) if use_danskin else self.g
     return self.set(reg_ot_cost=ent_reg_cost(f, g, ot_prob, lse_mode))
@@ -308,7 +312,7 @@ class SinkhornOutput(NamedTuple):
     return dual_cost
 
   @property
-  def primal_cost(self) -> jnp.ndarray:
+  def primal_cost(self) -> float:
     """Return transport cost of current solution at geometry."""
     return self.transport_cost_at_geom(other_geom=self.geom)
 
@@ -682,6 +686,10 @@ class Sinkhorn:
       when the algorithm has converged with a low tolerance.
     jit: Whether to jit the iteration loop.
     initializer: how to compute the initial potentials/scalings.
+    progress_fn: callback function which gets called during the Sinkhorn
+      iterations, so the user can display the error at each iteration,
+      e.g., using a progress bar. See :func:`~ott.utils.default_progress_fn`
+      for a basic implementation.
     kwargs_init: keyword arguments when creating the initializer.
   """
 
@@ -700,9 +708,10 @@ class Sinkhorn:
       use_danskin: Optional[bool] = None,
       jit: bool = True,
       implicit_diff: Optional[implicit_lib.ImplicitDiff
-                             ] = implicit_lib.ImplicitDiff(),  # noqa: E124
-      initializer: Union[Literal["default", "gaussian", "sorting"],
+                             ] = implicit_lib.ImplicitDiff(),  # noqa: B008
+      initializer: Union[Literal["default", "gaussian", "sorting", "subsample"],
                          init_lib.SinkhornInitializer] = "default",
+      progress_fn: Optional[ProgressCallbackFn_t] = None,
       kwargs_init: Optional[Mapping[str, Any]] = None,
   ):
     self.lse_mode = lse_mode
@@ -733,6 +742,7 @@ class Sinkhorn:
     self.parallel_dual_updates = parallel_dual_updates
     self.recenter_potentials = recenter_potentials
     self.initializer = initializer
+    self.progress_fn = progress_fn
     self.kwargs_init = {} if kwargs_init is None else kwargs_init
 
     # Force implicit_differentiation to True when using Anderson acceleration,
@@ -755,6 +765,7 @@ class Sinkhorn:
       self,
       ot_prob: linear_problem.LinearProblem,
       init: Tuple[Optional[jnp.ndarray], Optional[jnp.ndarray]] = (None, None),
+      rng: jax.random.PRNGKeyArray = jax.random.PRNGKey(0)
   ) -> SinkhornOutput:
     """Run Sinkhorn algorithm.
 
@@ -762,13 +773,14 @@ class Sinkhorn:
       ot_prob: Linear OT problem.
       init: Initial dual potentials/scalings f_u and g_v, respectively.
         Any `None` values will be initialized using the initializer.
+      rng: Random number generator key for stochastic initialization.
 
     Returns:
       The Sinkhorn output.
     """
     initializer = self.create_initializer()
     init_dual_a, init_dual_b = initializer(
-        ot_prob, *init, lse_mode=self.lse_mode
+        ot_prob, *init, lse_mode=self.lse_mode, rng=rng
     )
     run_fn = jax.jit(run) if self.jit else run
     return run_fn(ot_prob, self, (init_dual_a, init_dual_b))
@@ -994,14 +1006,16 @@ class Sinkhorn:
       return init_lib.GaussianInitializer()
     if self.initializer == "sorting":
       return init_lib.SortingInitializer(**self.kwargs_init)
+    if self.initializer == "subsample":
+      return init_lib.SubsampleInitializer(**self.kwargs_init)
     raise NotImplementedError(
         f"Initializer `{self.initializer}` is not yet implemented."
     )
 
   def tree_flatten(self):  # noqa: D102
     aux = vars(self).copy()
-    aux['norm_error'] = aux.pop('_norm_error')
-    aux.pop('threshold')
+    aux["norm_error"] = aux.pop("_norm_error")
+    aux.pop("threshold")
     return [self.threshold], aux
 
   @classmethod
@@ -1040,7 +1054,13 @@ def iterations(
       state: SinkhornState, compute_error: bool
   ) -> SinkhornState:
     ot_prob, solver = const
-    return solver.one_iteration(ot_prob, state, iteration, compute_error)
+    state = solver.one_iteration(ot_prob, state, iteration, compute_error)
+    if solver.progress_fn is not None:
+      host_callback.id_tap(
+          solver.progress_fn,
+          (iteration, solver.inner_iterations, solver.max_iterations, state)
+      )
+    return state
 
   # Run the Sinkhorn loop. Choose either a standard fixpoint_iter loop if
   # differentiation is implicit, otherwise switch to the backprop friendly
@@ -1105,7 +1125,7 @@ def solve(
     tau_b: float = 1.0,
     rank: int = -1,
     **kwargs: Any
-) -> Union[SinkhornOutput, 'LRSinkhornOutput']:
+) -> Union[SinkhornOutput, "LRSinkhornOutput"]:
   """Solve linear regularized OT problem using Sinkhorn iterations.
 
   Args:
